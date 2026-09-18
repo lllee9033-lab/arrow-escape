@@ -1,15 +1,16 @@
-cat > .gitignore << 'EOF'
-# MacÏµÍ³ÎÄ¼þ
+# Macç³»ç»Ÿæ–‡ä»¶
 .DS_Store
 
-# PythonÔËÐÐ»º´æ
+# Pythonç¼–è¯‘ç¼“å­˜
 __pycache__/
 *.pyc
 
-# ±à¼­Æ÷ÅäÖÃ
+# ç¼–è¾‘å™¨é…ç½®
 .vscode/
 .idea/
 
-# ±¾µØ´æµµÎÄ¼þ
+# å¤§ä½“ç§¯éŸ³é¢‘æ–‡ä»¶
+assets/bgm.m4a
+
+# ä¸´æ—¶æ–‡ä»¶
 *.json
-EOF

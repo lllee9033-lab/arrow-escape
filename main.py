@@ -64,6 +64,7 @@ LEVELS = [
 ]
 # 每关时间限制（秒）
 LEVEL_TIME_LIMIT = [30, 60, 90]
+FOG_LEVEL_COUNT = 10  # 迷雾是完整的有限挑战，而非与无尽模式重复
 
 # ================= 无尽模式随机关卡生成 =================
 def _grid_solvable(grid):
@@ -92,6 +93,33 @@ def _grid_solvable(grid):
                     blocked = True; break
             if not blocked:
                 picked = (r, c)
+                break
+        if picked is None:
+            return False
+        del active[picked]
+    return True
+
+def _fog_shell_solvable(grid):
+    """迷雾模式专用校验：每一步只能选择当前剩余箭头的最外圈。"""
+    active = {(r, c): value for r, row in enumerate(grid) for c, value in enumerate(row)
+              if value in 'UDLR'}
+    while active:
+        rows = [pos[0] for pos in active]
+        cols = [pos[1] for pos in active]
+        top, bottom, left, right = min(rows), max(rows), min(cols), max(cols)
+        picked = None
+        for (row, col), direction in active.items():
+            if row not in (top, bottom) and col not in (left, right):
+                continue
+            blocked = any(
+                (direction == 'U' and other_col == col and other_row < row)
+                or (direction == 'D' and other_col == col and other_row > row)
+                or (direction == 'L' and other_row == row and other_col < col)
+                or (direction == 'R' and other_row == row and other_col > col)
+                for (other_row, other_col) in active if (other_row, other_col) != (row, col)
+            )
+            if not blocked:
+                picked = (row, col)
                 break
         if picked is None:
             return False
@@ -133,19 +161,20 @@ def generate_fog_level(level_num):
             for c in range(size):
                 row.append(random.choice(arrows) if random.random() < density else '.')
             grid.append(row)
-        if any(v in 'UDLR' for row in grid for v in row) and _grid_solvable(grid):
+        if (any(v in 'UDLR' for row in grid for v in row)
+                and _grid_solvable(grid) and _fog_shell_solvable(grid)):
             return grid
 # ================= 实体类 =================
 class Arrow:
-    def __init__(self, row, col, direction, offset_x, offset_y):
+    def __init__(self, row, col, direction, offset_x, offset_y, cell_size=CELL_SIZE):
         self.row = row
         self.col = col
         self.direction = direction
         self.state = 'idle'  # 状态：idle(静止), shaking(碰撞晃动), flying(飞出), dead(已清除)
-        
+        self.cell_size = cell_size
         # 屏幕中心像素坐标
-        self.x = offset_x + col * CELL_SIZE + CELL_SIZE // 2
-        self.y = offset_y + row * CELL_SIZE + CELL_SIZE // 2
+        self.x = offset_x + col * cell_size + cell_size // 2
+        self.y = offset_y + row * cell_size + cell_size // 2
         
         self.shake_timer = 0
         self.vx = 0
@@ -252,6 +281,9 @@ class Game:
         pygame.init()
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
         pygame.display.set_caption("一箭又一箭")
+        # 隐藏系统光标，改用自绘像素柯基光标
+        pygame.mouse.set_visible(False)
+        self.build_cursor()
         # 设置窗口图标
         icon_path = Path(__file__).parent / "assets" / "game-icon.png"
         icon = pygame.image.load(str(icon_path)).convert_alpha()
@@ -259,8 +291,8 @@ class Game:
         self.clock = pygame.time.Clock()
         # 背景音乐：夏日曼哈顿咖啡店 Jazz（用 macOS 原生 afplay 循环播放）
         bgm_path = str(Path(__file__).parent / "assets" / "bgm.m4a")
-        # 循环脚本每秒检测游戏进程是否存活：游戏一旦被关闭（含直接关终端/强杀），
-        # 立即终止当前 afplay 并退出，避免出现“游戏关了音乐还在放”的孤儿进程。
+        # 循环脚本每秒检测游戏进程是否存活
+        # 立即终止当前 afplay 并退出
         parent_pid = os.getpid()
         bgm_script = (
             f'while kill -0 {parent_pid} 2>/dev/null; do '
@@ -274,14 +306,29 @@ class Game:
             shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True
         )
-        # 来自用户提供参考图的柯基精灵。路径相对本脚本，避免受启动目录影响。
+        # 交互音效由 pygame 混音器播放，与外部循环 BGM 分开；无音频设备时自动降级。
+        self.sfx = {}
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+            sfx_specs = {
+                'cast': ('sfx_cast.wav', 0.34),
+                'error': ('sfx_error.wav', 0.34),
+                'hint': ('sfx_hint.wav', 0.26),
+                'win': ('sfx_win.wav', 0.32),
+            }
+            for name, (filename, volume) in sfx_specs.items():
+                sound = pygame.mixer.Sound(str(Path(__file__).parent / 'assets' / filename))
+                sound.set_volume(volume)
+                self.sfx[name] = sound
+        except pygame.error:
+            self.sfx = {}
+        # 柯基精灵
         sprite_path = Path(__file__).parent / "assets" / "corgi-reference-sprite.png"
         self.corgi_sprite = pygame.image.load(str(sprite_path)).convert_alpha()
-        # 按原始比例做最近邻缩放，完整保留脚掌下方的深棕色像素描边。
         self.corgi_sprite = pygame.transform.scale(self.corgi_sprite, (140, 216))
         star_path = Path(__file__).parent / "assets" / "luck-star-reference.png"
         self.luck_star_sprite = pygame.image.load(str(star_path)).convert_alpha()
-        # 缩小为参考图相对面板的比例；柔化蒙版会保留边沿半透明感。
         self.luck_star_sprite = pygame.transform.smoothscale(self.luck_star_sprite, (28, 28))
         rating_star_path = Path(__file__).parent / "assets" / "clear-rating-star.png"
         self.clear_rating_star = pygame.image.load(str(rating_star_path)).convert_alpha()
@@ -329,6 +376,7 @@ class Game:
         self.font_normal = self.get_chinese_font(28)
         self.font_small = self.get_chinese_font(20)
         self.font_pass = self.get_chinese_font(72)
+        self.font_menu_title = self.get_chinese_font(36)
         
         # 游戏全局变量
         self.state = 'MENU'  # MENU, FISHING_RESULT, PLAYING, LEVEL_CLEAR, GAME_OVER, VICTORY
@@ -350,6 +398,7 @@ class Game:
         self.arrows = []
         self.grid_rows = 0
         self.grid_cols = 0
+        self.cell_size = CELL_SIZE
         self.board_offset_x = 0
         self.board_offset_y = 150
         self.level_start_time = 0  # 关卡开始时间
@@ -386,6 +435,35 @@ class Game:
         self.corgi_btn_rect = pygame.Rect(0, 0, 60, 56)
         self.hint_arrow_idx = -1   # 被提示高亮的箭头索引
         self.hint_timer = 0        # 提示剩余帧数
+
+    def play_sfx(self, name):
+        """播放短交互音；混音器不可用或音效缺失时保持静默。"""
+        sound = self.sfx.get(name)
+        if sound is not None:
+            sound.play()
+
+    def build_cursor(self):
+        """加载用户自制像素柯基光标，最近邻缩放到与系统光标相近的尺寸。"""
+        try:
+            cursor_path = Path(__file__).parent / 'assets' / 'corgi-cursor-pixel.png'
+            img = pygame.image.load(str(cursor_path)).convert_alpha()
+            # 原图 64x76，缩到 10x10（最近邻保留硬边像素）
+            self.cursor_surf = pygame.transform.scale(img, (32, 32))
+            # 箭头尖（热点）缩放后约在 (1,0)
+            self.cursor_hot = (0, 0)
+        except (pygame.error, FileNotFoundError):
+            pygame.mouse.set_visible(True)
+            self.cursor_surf = None
+
+    def draw_custom_cursor(self):
+        """每帧最上层绘制像素光标，热点对齐鼠标；按下时轻微右下偏移。"""
+        if self.cursor_surf is None:
+            return
+        cmx, cmy = pygame.mouse.get_pos()
+        hx, hy = self.cursor_hot
+        ox, oy = (1, 1) if pygame.mouse.get_pressed()[0] else (0, 0)
+        self.screen.blit(self.cursor_surf, (cmx - hx + ox, cmy - hy + oy))
+
     def get_chinese_font(self, size):
         """加载像素风中文字体，回退到系统字体"""
         # 优先使用缝合像素字体
@@ -418,9 +496,13 @@ class Game:
         self.grid_cols = len(grid[0])
         self.grid_map = [list(row) for row in grid]
         
+        # 大棋盘（如6x6）适当缩小格子，避免与左右宝箱/柯基按钮重叠；
+        # 水平安全区约 x=88~512（宽424），垂直安全区高约470。
+        self.cell_size = min(CELL_SIZE, 400 // self.grid_cols, 470 // self.grid_rows)
+        cs = self.cell_size
         # 居中计算
-        board_w = self.grid_cols * CELL_SIZE
-        board_h = self.grid_rows * CELL_SIZE
+        board_w = self.grid_cols * cs
+        board_h = self.grid_rows * cs
         self.board_offset_x = (WIDTH - board_w) // 2
         # 草坪区域 y=216~636，考虑底部河岸与水面视觉重量，取视觉中心略偏上
         grass_center_y = 380
@@ -431,7 +513,7 @@ class Game:
             for c in range(self.grid_cols):
                 val = grid[r][c]
                 if val in ['U', 'D', 'L', 'R']:
-                    self.arrows.append(Arrow(r, c, val, self.board_offset_x, self.board_offset_y))
+                    self.arrows.append(Arrow(r, c, val, self.board_offset_x, self.board_offset_y, self.cell_size))
     def get_time_limit(self):
         """当前关卡时间限制（秒），基础模式取表，无尽/迷雾模式按序号动态计算。"""
         if self.game_mode in ('endless', 'fog'):
@@ -439,31 +521,21 @@ class Game:
         return LEVEL_TIME_LIMIT[self.level_index]
 
     def recompute_fog(self):
-        """迷雾模式可见性：四邻（上下左右）有空位/棋盘外/已飞走箭头的箭头才点亮。"""
+        """迷雾模式可见性：仅当前剩余箭头的动态最外圈可见。"""
         for a in self.arrows:
             a.is_visible = True
         if self.game_mode != 'fog':
             return
-        rows, cols = self.grid_rows, self.grid_cols
-        empty = set()
-        for r in range(rows):
-            for c in range(cols):
-                if self.grid_map[r][c] == '.':
-                    empty.add((r, c))
-        for a in self.arrows:
-            if a.state == 'dead':
-                empty.add((a.row, a.col))
-        for a in self.arrows:
-            if a.state == 'dead':
-                continue
-            visible = False
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = a.row + dr, a.col + dc
-                if not (0 <= nr < rows and 0 <= nc < cols):
-                    visible = True; break
-                if (nr, nc) in empty:
-                    visible = True; break
-            a.is_visible = visible
+        active = [a for a in self.arrows if a.state != 'dead']
+        if not active:
+            return
+        top = min(a.row for a in active)
+        bottom = max(a.row for a in active)
+        left = min(a.col for a in active)
+        right = max(a.col for a in active)
+        for arrow in active:
+            arrow.is_visible = (arrow.row in (top, bottom)
+                                or arrow.col in (left, right))
     def is_path_blocked(self, arrow):
         """核心算法：路径阻挡检测"""
         for other in self.arrows:
@@ -498,21 +570,28 @@ class Game:
             if arrow.state == 'idle':
                 # 勾股定理判断点击是否在箭头中心圆角范围内
                 dist = math.hypot(mx - arrow.x, my - arrow.y)
-                if dist < CELL_SIZE // 2:
+                if dist < self.cell_size // 2:
                     if self.is_path_blocked(arrow):
                         # 阻挡：执行晃动动画并扣除生命
                         arrow.state = 'shaking'
                         arrow.shake_timer = 22
                         self.mistakes -= 1
                         self.spawn_arrow_effect(arrow.x, arrow.y, ARROW_COLORS[arrow.direction], 'error')
+                        self.play_sfx('error')
                     else:
-                        # 通畅：先蓄力预备，再加速飞出
-                        arrow.state = 'windup'
-                        arrow.windup_timer = 7
+                        # 只有棋盘最外圈的箭头有后拉蓄力；内部箭头保持直接飞出，
+                        # 避免棋盘中部每次消除都出现不必要的回拉动作。
+                        is_outer = (arrow.row in (0, self.grid_rows - 1)
+                                    or arrow.col in (0, self.grid_cols - 1))
                         dvec = {'U': (0, -1), 'D': (0, 1),
                                 'L': (-1, 0), 'R': (1, 0)}[arrow.direction]
                         arrow.dirx, arrow.diry = dvec
                         arrow.fly_speed = 5.0
+                        if is_outer:
+                            arrow.state = 'windup'
+                            arrow.windup_timer = 7
+                        else:
+                            arrow.state = 'flying'
                         self.spawn_arrow_effect(arrow.x, arrow.y, ARROW_COLORS[arrow.direction],
                                                 'launch', arrow.dirx, arrow.diry)
                     break # 每次点击只触发一个
@@ -529,6 +608,7 @@ class Game:
         else:
             rect.topleft = (x, y)
         self.screen.blit(bold, rect)
+
     def draw_button(self, rect, text):
         """辅助渲染按钮"""
         mx, my = pygame.mouse.get_pos()
@@ -607,7 +687,6 @@ class Game:
                          (inner.right - 8, inner.top + 5), 2)
 
     def draw_reference_corgi(self, cx, bottom_y):
-        """将用户提供图片中提取的透明柯基精灵置于草地上。"""
         rect = self.corgi_sprite.get_rect(midbottom=(cx, bottom_y))
         # 阴影收在草地范围内，避免与河岸的深色边线叠在一起而吃掉脚掌轮廓。
         pygame.draw.ellipse(self.screen, (49, 116, 66), (cx - 55, bottom_y - 10, 110, 10))
@@ -695,6 +774,7 @@ class Game:
                     and not self.is_path_blocked(arrow)):
                 self.hint_arrow_idx = i
                 self.hint_timer = 90  # 约1.5秒
+                self.play_sfx('hint')
                 return True
         return False
 
@@ -745,7 +825,8 @@ class Game:
         hovering = self.corgi_btn_rect.collidepoint(pygame.mouse.get_pos())
         # 悬停时略微放大跳动
         self.draw_running_corgi(cx, base_y, excited=hovering)
-        self.draw_text("菜单", self.font_small, BROWN, cx, 602, center=True)
+        # 文字与狗狗的间距对齐宝箱“AI提示”（图标底缘下约 10px）
+        self.draw_text("菜单", self.font_small, BROWN, cx, base_y + 10, center=True)
 
     def _star_points(self, cx, cy, r_outer, r_inner):
         pts = []
@@ -756,7 +837,7 @@ class Game:
         return pts
 
     def setup_clear_particles(self):
-        """通关庆祝：预渲染放射光、光晕、初始化彩屑（参考轻松熊胜利界面）。"""
+        """通关庆祝：预渲染放射光、光晕、初始化彩屑。"""
         self.confetti = []
         self.fireworks = []
         self.fw_timer = 0.0
@@ -998,7 +1079,6 @@ class Game:
                 pygame.draw.arc(self.screen, (205, 194, 118),
                                 (hook[0]-rr, hook[1]-rr//2, rr*2, rr),
                                 0.2, math.pi - 0.2, 2)
-        # 像录像里的浅色小饵钩：不使用抢眼的红色浮漂。
         pygame.draw.rect(self.screen, (104, 91, 67), (hook[0]-2, hook[1]-2, 5, 5))
         pygame.draw.rect(self.screen, (248, 244, 211), (hook[0]-1, hook[1]-2, 3, 3))
         pygame.draw.arc(self.screen, (222, 224, 213), (hook[0]-2, hook[1]+1, 7, 9), 0, math.pi, 1)
@@ -1051,25 +1131,23 @@ class Game:
                 'rules': ('关卡会持续升级，箭头不断增加，', '看看你能坚持到第几关。'),
             },
             'fog': {
-                'title': '迷雾模式', 'subtitle': '~ 小心未知路线 ~',
+                'title': '迷雾模式', 'subtitle': '~ 完成 10 关迷雾挑战 ~',
                 'rules': ('迷雾会遮住部分箭头，', '找出安全路线再行动。'),
             },
         }[mode]
-        # 原视频弹窗出现时，背景仍可见但被深色半透明遮罩压低。
         t = (pygame.time.get_ticks() - self.fishing_result_start) / 1000.0
         reveal = min(1.0, t / 0.22)
         veil = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         veil.fill((26, 52, 54, int(142 * reveal)))
         self.screen.blit(veil, (0, 0))
 
-        # 第一帧的一点暖白闪屏，是原效果里“爆开”感最明显的来源。
+        # 第一帧的一点暖白闪屏。
         if t < 0.10:
             flash = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
             flash.fill((255, 246, 185, int(58 * (1 - t / 0.10))))
             self.screen.blit(flash, (0, 0))
 
-        # 结果框出现前的碎光爆发：先由中心向外散开，再被木框盖住，
-        # 形成录像里“震一下、炸出来”的过渡，而不是突兀切画面。
+        # 结果框出现前的碎光爆发：先由中心向外散开，再被木框盖住。
         burst_p = min(1.0, t / 0.30)
         if burst_p < 1.0:
             burst = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -1087,7 +1165,7 @@ class Game:
                                 (cx - radius, cy - radius // 2, radius * 2, radius), 2)
             self.screen.blit(burst, (0, 0))
 
-        # 从下方轻弹入场；前 0.14 秒的横向微震与原视频的"弹出"节奏一致。
+        # 从下方轻弹入场。
         ease = 1 - (1 - reveal) ** 3
         shake_p = max(0.0, 1.0 - t / 0.14)
         shake_x = int(math.sin(t * 105) * 4 * shake_p)
@@ -1101,14 +1179,14 @@ class Game:
         pygame.draw.line(self.screen, (255, 252, 225),
                          (inner.left + 19, inner.top + 9), (inner.right - 19, inner.top + 9), 2)
 
-        # 使用同一份参考星星素材；角星随时间微转，边缘仍是透明的柔和像素。
+        # 角星随时间微转，边缘仍是透明的柔和像素。
         spin = (pygame.time.get_ticks() * 0.12) % 360
         left_star = pygame.transform.rotozoom(self.luck_star_sprite, spin, 1.62)
         right_star = pygame.transform.rotozoom(self.luck_star_sprite, -spin, 1.62)
         self.screen.blit(left_star, left_star.get_rect(center=(panel.left + 2, panel.top + 2)))
         self.screen.blit(right_star, right_star.get_rect(center=(panel.right - 2, panel.top + 2)))
 
-        # 参考图右上角的红色关闭键。
+        # 红色关闭键。
         self.btn_fishing_close = pygame.Rect(panel.right - 58, panel.top + 20, 40, 40)
         close = self.btn_fishing_close
         pygame.draw.rect(self.screen, (65, 42, 27), close.move(0, 5), border_radius=10)
@@ -1119,7 +1197,7 @@ class Game:
         self.draw_text(details['title'], self.font_title, (89, 55, 31), panel.centerx, panel.top + 52, center=True)
         self.draw_text(details['subtitle'], self.font_normal, (151, 108, 67), panel.centerx, panel.top + 95, center=True)
 
-        # 钓到的素材作为结果物，轻微上下浮动，保留视频刚收线完成的余韵。
+        # 钓到的素材作为结果物，轻微上下浮动。
         item = self.menu_fishing_sprites[mode]
         item = pygame.transform.rotozoom(item, math.sin(t * 6) * 2, 1.15)
         self.screen.blit(item, item.get_rect(center=(panel.centerx, panel.top + 168 + int(math.sin(t * 5) * 3))))
@@ -1132,7 +1210,7 @@ class Game:
         self.draw_text(details['rules'][1], self.font_small, (100, 62, 36), rule_box.centerx,
                        rule_box.top + 62, center=True)
 
-        # 与参考图一致的绿/蓝两枚行动按钮：重新选择或直接开始。
+        # 重新选择或直接开始。
         self.btn_fishing_cancel = pygame.Rect(panel.left + 40, panel.bottom - 74, 160, 54)
         self.btn_fishing_confirm = pygame.Rect(panel.right - 200, panel.bottom - 74, 160, 54)
         for rect, main, light, text in (
@@ -1186,7 +1264,7 @@ class Game:
         # 顶部身份卡片
         progress = pygame.Rect(24, 22, 222, 66)
         self.draw_panel(progress)
-        self.draw_text("箭 阵 逃 脱", self.font_normal, BROWN, progress.left + 20, progress.top + 18)
+        self.draw_text("汪汪救箭队", self.font_menu_title, BROWN, progress.centerx, progress.centery, center=True)
 
         stage = pygame.Rect(390, 22, 186, 66)
         self.draw_panel(stage)
@@ -1198,8 +1276,6 @@ class Game:
                                                       (stage.left + 34 + i * 36, stage.top + 44),
                                                       (stage.left + 29 + i * 36, stage.top + 51)])
         self.draw_text("2 / 3", self.font_small, BROWN, stage.right - 53, stage.top + 35)
-
-        # 居中的参考图柯基素材
         self.draw_reference_corgi(WIDTH // 2, 487)
 
         # 木牌文案
@@ -1273,9 +1349,9 @@ class Game:
         bone_rect = self.bone_sprite.get_rect(center=(bone_x, bone_y))
         self.screen.blit(self.bone_sprite, bone_rect)
 
-        # 时间文字
+        # 时间文字（位置适当下调）
         self.draw_text(f"{int(remaining):02d}s", self.font_small, BROWN,
-                       rect.centerx, rect.top + 10, center=True)
+                       rect.centerx, rect.top + 25, center=True)
 
     def draw_playing_hud(self, active_count):
         """在顶部显示关卡、剩余箭头和失误次数。"""
@@ -1334,8 +1410,9 @@ class Game:
 
     def draw_pixel_board(self):
         """参考幸运面板的厚木框棋盘；格子与箭头共用深棕描边。"""
-        board_w = self.grid_cols * CELL_SIZE
-        board_h = self.grid_rows * CELL_SIZE
+        cs = self.cell_size
+        board_w = self.grid_cols * cs
+        board_h = self.grid_rows * cs
         outer = pygame.Rect(self.board_offset_x - 22, self.board_offset_y - 22,
                             board_w + 44, board_h + 44)
         # 与参考弹窗一致的三层关系：外侧深棕投影 → 褐色主边框 → 内侧浅色。
@@ -1347,20 +1424,20 @@ class Game:
         grid_rect = pygame.Rect(self.board_offset_x, self.board_offset_y, board_w, board_h)
         for r in range(self.grid_rows):
             for c in range(self.grid_cols):
-                cell = pygame.Rect(self.board_offset_x + c * CELL_SIZE,
-                                   self.board_offset_y + r * CELL_SIZE,
-                                   CELL_SIZE, CELL_SIZE)
+                cell = pygame.Rect(self.board_offset_x + c * cs,
+                                   self.board_offset_y + r * cs,
+                                   cs, cs)
                 pygame.draw.rect(self.screen, (255, 239, 191), cell)
                 # 单个角落高光使格子读为木盘上的卡槽。
                 pygame.draw.rect(self.screen, (255, 250, 216), (cell.left + 4, cell.top + 4, 14, 3))
 
-        # 内部分格保留等粗实线；最外圈改为参考图式虚线。
+        # 内部分格保留等粗实线；最外圈改为虚线。
         grid_line = (205, 166, 105)
         for col in range(1, self.grid_cols):
-            x = self.board_offset_x + col * CELL_SIZE
+            x = self.board_offset_x + col * cs
             pygame.draw.line(self.screen, grid_line, (x, grid_rect.top), (x, grid_rect.bottom), 2)
         for row in range(1, self.grid_rows):
-            y = self.board_offset_y + row * CELL_SIZE
+            y = self.board_offset_y + row * cs
             pygame.draw.line(self.screen, grid_line, (grid_rect.left, y), (grid_rect.right, y), 2)
         self.draw_dashed_rect(grid_rect, grid_line, width=2)
 
@@ -1371,7 +1448,7 @@ class Game:
 
     def draw_playing_footer(self):
         # 动态定位在棋盘外框正下方，避免大关卡重叠
-        board_bottom = self.board_offset_y + self.grid_rows * CELL_SIZE + 22
+        board_bottom = self.board_offset_y + self.grid_rows * self.cell_size + 22
         footer_y = board_bottom + 10
         footer = pygame.Rect((WIDTH - 322) // 2, footer_y, 322, 39)
         self.draw_panel(footer)
@@ -1505,6 +1582,7 @@ class Game:
                                     self.menu_cast_mode = mode
                                     self.menu_cast_start = pygame.time.get_ticks()
                                     self.menu_cast_target = target.center
+                                    self.play_sfx('cast')
                                     break
 
                     elif self.state == 'FISHING_RESULT':
@@ -1522,7 +1600,9 @@ class Game:
                     elif self.state == 'LEVEL_CLEAR':
                         if self.btn_center.collidepoint(mx, my):
                             self.level_index += 1
-                            if self.game_mode == 'basic' and self.level_index >= len(LEVELS):
+                            # 基础为 3 关，迷雾为 10 关；只有无尽模式持续生成新关卡。
+                            mode_limit = FOG_LEVEL_COUNT if self.game_mode == 'fog' else len(LEVELS)
+                            if self.game_mode in ('basic', 'fog') and self.level_index >= mode_limit:
                                 self.state = 'VICTORY'
                             else:
                                 self.load_level()
@@ -1570,17 +1650,22 @@ class Game:
                     self.clear_time = (pygame.time.get_ticks() - self.level_start_time) / 1000
                     used_mistakes = self.max_mistakes - self.mistakes
                     time_limit = self.get_time_limit()
-                    if used_mistakes <= 1 and self.clear_time <= time_limit * 0.6:
-                        self.current_stars = 3
-                    elif used_mistakes <= 3 and self.clear_time <= time_limit * 0.85:
-                        self.current_stars = 2
+                    # 时间定基础档：耗时占比 <50% 三星、50%~75% 二星、>=75% 一星
+                    ratio = self.clear_time / time_limit
+                    if ratio < 0.5:
+                        base_stars = 3
+                    elif ratio < 0.75:
+                        base_stars = 2
                     else:
-                        self.current_stars = 1
+                        base_stars = 1
+                    # 每累计 2 次失误降 1 档，最低保留 1 星
+                    self.current_stars = max(1, base_stars - used_mistakes // 2)
                     self.clear_anim_start = pygame.time.get_ticks()
-                    if self.game_mode == 'basic':
+                    if self.game_mode in ('basic', 'fog'):
                         self.total_clear_time += self.clear_time
                         self.total_mistakes += used_mistakes
                     self.setup_clear_particles()
+                    self.play_sfx('win')
                     self.state = 'LEVEL_CLEAR'
                 elif self.mistakes <= 0:
                     self.game_over_reason = 'mistakes'
@@ -1611,7 +1696,7 @@ class Game:
                     if ha.state == 'idle':
                         if self.hint_timer % 20 < 12:
                             pygame.draw.circle(self.screen, (255, 210, 60),
-                                               (ha.x, ha.y), CELL_SIZE // 2 - 4, 4)
+                                               (ha.x, ha.y), self.cell_size // 2 - 4, 4)
                         self.hint_timer -= 1
                     else:
                         self.hint_timer = 0
@@ -1630,6 +1715,7 @@ class Game:
             elif self.state == 'VICTORY':
                 t = (pygame.time.get_ticks() - self.clear_anim_start) / 1000
                 self.draw_completion_screen("ALL CLEAR", "返 回 主 菜 单", t, show_total=True)
+            self.draw_custom_cursor()
             pygame.display.flip()
             self.clock.tick(FPS)
 if __name__ == "__main__":
